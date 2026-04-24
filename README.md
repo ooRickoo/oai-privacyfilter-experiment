@@ -36,7 +36,6 @@ The model is pretrained autoregressively (similar architecture to `gpt-oss`) the
 | License | Apache 2.0 |
 | Languages | Primarily English; some multilingual robustness |
 
-Because only ~50M parameters are active per token thanks to MoE routing, inference is significantly faster than the raw 1.5B parameter count suggests.
 
 ---
 
