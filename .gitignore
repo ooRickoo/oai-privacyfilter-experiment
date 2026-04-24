@@ -1,0 +1,14 @@
+# Virtual environment
+venv/
+
+# Hidden files and folders (dot-prefixed), but not .gitignore itself
+.*
+!.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ONNX model exports
+onnx_model/
