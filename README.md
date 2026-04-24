@@ -1,6 +1,6 @@
 # OpenAI Privacy Filter — Local Demo
 
-A Python experiment that runs the [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) model **entirely locally** to detect and redact personally identifiable information (PII) from free-form text.
+A Python experiment that runs the [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) model locally to detect and redact personally identifiable information (PII) from free-form text.
 
 ---
 
