@@ -4,6 +4,10 @@ venv/
 # Hidden files and folders (dot-prefixed), but not .gitignore itself
 .*
 !.gitignore
+!.env.example
+
+# .env contains secrets — never commit it; use .env.example as the template
+.env
 
 # Python cache
 __pycache__/
@@ -12,3 +16,6 @@ __pycache__/
 
 # ONNX model exports
 onnx_model/
+
+# Downloaded model weights — large binary files, don't commit them
+model/

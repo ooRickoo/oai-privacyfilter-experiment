@@ -2,3 +2,4 @@ pandas
 faker
 torch
 transformers
+python-dotenv

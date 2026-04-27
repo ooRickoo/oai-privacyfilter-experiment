@@ -27,12 +27,23 @@ Detected PII types (OpenAI Privacy Filter label set)
 Performance notes
 -----------------
 - On Apple Silicon (M-series) with MPS enabled, expect ~10–40 rows/sec
-  depending on chip generation and text length.  The model is accurate but
+  depending on chip generation and text length. The model is accurate but
   compute-heavy — it is best suited for:
     • Offline / batch sanitisation pipelines
     • Low-volume inline use (e.g. inside an AI Agent tool call)
   It is NOT designed for high-volume, low-latency inline data streams.
-- BATCH_SIZE and PROGRESS_EVERY can be tuned at the top of this file.
+
+Architecture
+------------
+- Single model instance on MPS/GPU — no worker threads hit the model.
+  The GPU serialises all batches internally and is far more efficient than
+  multiple CPU processes competing for resources.
+- A background writer thread consumes completed batches from a queue and
+  writes to CSV while the main thread is already running the next inference
+  batch — keeping the GPU fed rather than waiting for disk I/O.
+- BATCH_SIZE=256 keeps MPS utilisation high (larger batches amortise the
+  fixed per-call overhead). Lower to 64 if you hit out-of-memory errors.
+- PROGRESS_EVERY and WRITER_QUEUE_DEPTH can be tuned at the top of this file.
 
 Output
 ------
@@ -51,12 +62,39 @@ import os
 import sys
 import time
 import csv
+import queue
+import threading
 import argparse
 from collections import defaultdict
+from pathlib import Path
+
+# ── Load .env ─────────────────────────────────────────────────────────────────
+# python-dotenv is optional but recommended.  Install with:
+#   pip install python-dotenv
+# Values already set in the environment always take precedence over .env.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # fall back to whatever is already in the environment
 
 import pandas as pd
 import torch
 from transformers import pipeline
+
+# ── Environment-driven config ─────────────────────────────────────────────────
+# HF_MODEL_ID     — Hugging Face repo ID (default: openai/privacy-filter)
+# LOCAL_MODEL_DIR — path to locally downloaded model weights; when set and the
+#                   directory exists, demo.py loads from disk instead of the
+#                   global HF cache, making it safe to run behind a proxy.
+# TRANSFORMERS_OFFLINE — set to "1" in .env to block all network calls.
+#                   The transformers library reads this variable natively.
+HF_MODEL_ID     = os.getenv("HF_MODEL_ID",    "openai/privacy-filter")
+LOCAL_MODEL_DIR = os.getenv("LOCAL_MODEL_DIR", "")
+
+# Resolve the model source: prefer the local directory if it exists.
+_local_path = Path(LOCAL_MODEL_DIR).resolve() if LOCAL_MODEL_DIR else None
+MODEL_SOURCE = str(_local_path) if (_local_path and _local_path.is_dir()) else HF_MODEL_ID
 
 # ── Tuneable knobs ────────────────────────────────────────────────────────────
 # MPS is Apple Silicon GPU — much faster than CPU for transformer inference.
@@ -68,9 +106,11 @@ elif torch.cuda.is_available():
 else:
     DEVICE = "cpu"
 
-# MPS can handle larger batches than CPU; tune if you hit OOM
-BATCH_SIZE     = 64
-PROGRESS_EVERY = 500    # print a status line every N rows
+# Larger batches keep MPS fed — 256 is a good starting point for Apple Silicon.
+# Lower to 64 if you hit out-of-memory errors.
+BATCH_SIZE     = 256
+PROGRESS_EVERY = 1000   # print a status line every N rows
+WRITER_QUEUE_DEPTH = 8  # max batches buffered between inference and CSV writer
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -102,11 +142,53 @@ def main():
     print()
 
     # ── Load model ────────────────────────────────────────────────────────────
+    # MODEL_SOURCE is resolved at startup (top of file):
+    #   • If LOCAL_MODEL_DIR is set in .env and the directory exists on disk,
+    #     the model is loaded directly from that path — no network access at all.
+    #   • Otherwise falls back to the HF repo ID, which loads from the global
+    #     HF disk cache (~/.cache/huggingface/hub/) if available, or downloads
+    #     the weights on first use.
+    #
+    # Expected model files (in LOCAL_MODEL_DIR or the HF cache snapshot dir):
+    #   config.json            — model architecture & label map
+    #   tokenizer_config.json  — tokenizer settings
+    #   tokenizer.json         — tokenizer vocabulary & rules
+    #   model.safetensors      — model weights (~500 MB, bfloat16)
+    #
+    # To download the model locally before going offline, run:
+    #   python download_model.py
+    # Then set TRANSFORMERS_OFFLINE=1 and LOCAL_MODEL_DIR in your .env.
+
+    # Warn early if the local model directory is missing so the user sees a
+    # clear message rather than a cryptic connection / proxy error.
+    offline = os.getenv("TRANSFORMERS_OFFLINE", "0").strip() == "1"
+    if offline and MODEL_SOURCE == HF_MODEL_ID:
+        # TRANSFORMERS_OFFLINE=1 but no local dir — will likely fail
+        print(
+            f"⚠  TRANSFORMERS_OFFLINE=1 is set but LOCAL_MODEL_DIR "
+            f"('{LOCAL_MODEL_DIR}') was not found on disk.\n"
+            "   Run  python download_model.py  first, then retry.\n"
+        )
+    elif MODEL_SOURCE == HF_MODEL_ID:
+        # Using the global HF cache — check it has been populated
+        try:
+            from huggingface_hub import try_to_load_from_cache, _CACHED_NO_EXIST
+            sentinel = try_to_load_from_cache(HF_MODEL_ID, "config.json")
+            if sentinel is None or sentinel is _CACHED_NO_EXIST:
+                print(
+                    f"⚠  Model '{HF_MODEL_ID}' not found in the local HF cache.\n"
+                    "   Run  python download_model.py  to download it first.\n"
+                )
+        except Exception:
+            pass  # huggingface_hub not available or cache layout changed — carry on
+    else:
+        print(f"Model source : {MODEL_SOURCE}  (local)")
+
     print("Loading model…")
     t0 = time.time()
     clf = pipeline(
         "token-classification",
-        model="openai/privacy-filter",
+        model=MODEL_SOURCE,
         aggregation_strategy="simple",
         device=DEVICE,
     )
@@ -131,40 +213,75 @@ def main():
     rows_done          = 0
     wall_start         = time.time()
 
-    with open("sanitized_data.csv", "w", newline="", encoding="utf-8") as fout:
-        writer = csv.writer(fout)
-        writer.writerow(["id", "original_text", "sanitized_text"])
+    # ── Background writer thread ──────────────────────────────────────────────
+    # The writer thread consumes completed batches from a queue and writes them
+    # to CSV while the main thread is already running the next inference batch.
+    # This keeps MPS busy instead of waiting for disk I/O.
+    write_queue    = queue.Queue(maxsize=WRITER_QUEUE_DEPTH)
+    writer_errors  = []
 
-        for batch_offset in range(0, total, BATCH_SIZE):
-            batch_texts = texts[batch_offset : batch_offset + BATCH_SIZE]
-            batch_ids   = ids[batch_offset   : batch_offset + BATCH_SIZE]
+    def csv_writer_thread(fpath):
+        try:
+            with open(fpath, "w", newline="", encoding="utf-8") as fout:
+                writer = csv.writer(fout)
+                writer.writerow(["id", "original_text", "sanitized_text"])
+                while True:
+                    item = write_queue.get()
+                    if item is None:          # sentinel — shut down
+                        break
+                    for row_id, original, sanitized in item:
+                        writer.writerow([row_id, original, sanitized])
+                    write_queue.task_done()
+        except Exception as e:
+            writer_errors.append(e)
 
-            # Run inference on the whole mini-batch at once
-            batch_results = clf(batch_texts, batch_size=BATCH_SIZE)
+    writer_thread = threading.Thread(
+        target=csv_writer_thread, args=("sanitized_data.csv",), daemon=True
+    )
+    writer_thread.start()
 
-            for i, entities in enumerate(batch_results):
-                sanitized = sanitize_text(batch_texts[i], entities)
-                writer.writerow([batch_ids[i], batch_texts[i], sanitized])
+    # ── Inference loop ────────────────────────────────────────────────────────
+    for batch_offset in range(0, total, BATCH_SIZE):
+        batch_texts = texts[batch_offset : batch_offset + BATCH_SIZE]
+        batch_ids   = ids[batch_offset   : batch_offset + BATCH_SIZE]
 
-                for e in entities:
-                    key = e["entity_group"].upper()
-                    detections_by_type[key] += 1
-                    total_detections        += 1
+        # GPU forward pass — dominates wall time
+        batch_results = clf(batch_texts, batch_size=BATCH_SIZE)
 
-            rows_done += len(batch_texts)
+        # Build rows and count detections (CPU, fast)
+        batch_rows = []
+        for i, entities in enumerate(batch_results):
+            sanitized = sanitize_text(batch_texts[i], entities)
+            batch_rows.append((batch_ids[i], batch_texts[i], sanitized))
+            for e in entities:
+                key = e["entity_group"].upper()
+                detections_by_type[key] += 1
+                total_detections        += 1
 
-            if rows_done % PROGRESS_EVERY == 0 or rows_done == total:
-                elapsed  = time.time() - wall_start
-                rps      = rows_done / elapsed if elapsed else 0
-                eta      = (total - rows_done) / rps if rps else 0
-                pct      = rows_done / total * 100
-                print(
-                    f"  [{_bar(pct)}] {pct:5.1f}%  "
-                    f"{rows_done:>7,}/{total:,}  "
-                    f"{rps:>7,.0f} rows/sec  "
-                    f"elapsed {elapsed:>5.0f}s  ETA {eta:>5.0f}s  "
-                    f"detections {total_detections:,}"
-                )
+        # Hand off to writer — non-blocking as long as queue isn't full
+        write_queue.put(batch_rows)
+
+        rows_done += len(batch_texts)
+
+        if rows_done % PROGRESS_EVERY == 0 or rows_done == total:
+            elapsed  = time.time() - wall_start
+            rps      = rows_done / elapsed if elapsed else 0
+            eta      = (total - rows_done) / rps if rps else 0
+            pct      = rows_done / total * 100
+            print(
+                f"  [{_bar(pct)}] {pct:5.1f}%  "
+                f"{rows_done:>7,}/{total:,}  "
+                f"{rps:>7,.0f} rows/sec  "
+                f"elapsed {elapsed:>5.0f}s  ETA {eta:>5.0f}s  "
+                f"detections {total_detections:,}"
+            )
+
+    # Signal writer to finish and wait for it to flush
+    write_queue.put(None)
+    writer_thread.join()
+
+    if writer_errors:
+        raise RuntimeError(f"CSV writer failed: {writer_errors[0]}")
 
     total_time = time.time() - wall_start
     print(f"{'─'*72}\n")
