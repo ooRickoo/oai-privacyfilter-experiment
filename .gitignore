@@ -15,7 +15,7 @@ __pycache__/
 *.pyo
 
 # ONNX model exports
-onnx_model/
+#onnx_model/
 
 # Downloaded model weights — large binary files, don't commit them
-model/
+#model/
